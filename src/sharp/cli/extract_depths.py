@@ -1,12 +1,6 @@
-"""Extract video frames and depth maps using SHARP's monodepth model.
+"""Contains `sharp extract-depths` CLI implementation.
 
-Usage:
-    python extract_depths.py -i video.mp4 -o output_dir/ [-c checkpoint.pt] [--fps 10] [--device cuda]
-
-This script:
-1. Extracts frames from a video (or reads from a frame directory)
-2. Runs SHARP's monodepth model on each frame
-3. Saves frames as PNGs and depth maps as .npy files
+Extract video frames and depth maps using SHARP's monodepth model.
 
 For licensing see accompanying LICENSE file.
 Copyright (C) 2025 Apple Inc. All Rights Reserved.
@@ -14,10 +8,12 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 from __future__ import annotations
 
-import argparse
+import json
 import logging
+import shutil
 from pathlib import Path
 
+import click
 import imageio.v2 as iio
 import numpy as np
 import torch
@@ -25,8 +21,8 @@ import torch.nn.functional as F
 
 from sharp.models import PredictorParams, create_predictor
 from sharp.utils import io as sharp_io
+from sharp.utils import logging as logging_utils
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
@@ -104,7 +100,7 @@ def extract_depth_map(
         image_pt[None], size=internal_shape, mode="bilinear", align_corners=True
     )
 
-    # Run monodepth — returns MonodepthOutput with .disparity field
+    # Run monodepth -- returns MonodepthOutput with .disparity field
     monodepth_output = monodepth_model(image_resized)
     disparity = monodepth_output.disparity  # [1, num_layers, H_internal, W_internal]
 
@@ -122,26 +118,54 @@ def extract_depth_map(
     return depth_original[0, 0].cpu().numpy()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Extract frames and depth maps from video using SHARP")
-    parser.add_argument("-i", "--input-path", type=Path, required=True,
-                        help="Path to video file or directory of frames")
-    parser.add_argument("-o", "--output-path", type=Path, required=True,
-                        help="Output directory for frames and depths")
-    parser.add_argument("-c", "--checkpoint-path", type=Path, default=None,
-                        help="Path to SHARP .pt checkpoint (downloads default if omitted)")
-    parser.add_argument("--fps", type=float, default=None,
-                        help="FPS to extract from video (default: video's native FPS)")
-    parser.add_argument("--device", type=str, default="default",
-                        help="Device: 'cpu', 'mps', 'cuda', or 'default'")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+@click.command()
+@click.option(
+    "-i",
+    "--input-path",
+    type=click.Path(path_type=Path, exists=True),
+    help="Path to video file or directory of frames.",
+    required=True,
+)
+@click.option(
+    "-o",
+    "--output-path",
+    type=click.Path(path_type=Path, file_okay=False),
+    help="Output directory for frames and depths.",
+    required=True,
+)
+@click.option(
+    "-c",
+    "--checkpoint-path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Path to SHARP .pt checkpoint (downloads default if omitted).",
+    required=False,
+)
+@click.option(
+    "--fps",
+    type=float,
+    default=None,
+    help="FPS to extract from video (default: video's native FPS).",
+)
+@click.option(
+    "--device",
+    type=str,
+    default="default",
+    help="Device: 'cpu', 'mps', 'cuda', or 'default'.",
+)
+@click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
+def extract_depths_cli(
+    input_path: Path,
+    output_path: Path,
+    checkpoint_path: Path | None,
+    fps: float | None,
+    device: str,
+    verbose: bool,
+):
+    """Extract frames and depth maps from video using SHARP's monodepth model."""
+    logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
     # Resolve device
-    device = args.device
     if device == "default":
         if torch.cuda.is_available():
             device = "cuda"
@@ -153,13 +177,11 @@ def main():
     LOGGER.info("Using device: %s", device)
 
     # Extract or load frames
-    input_path: Path = args.input_path
-    output_path: Path = args.output_path
     output_path.mkdir(parents=True, exist_ok=True)
 
     video_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
     if input_path.is_file() and input_path.suffix.lower() in video_extensions:
-        frame_paths = extract_frames_from_video(input_path, output_path, fps=args.fps)
+        frame_paths = extract_frames_from_video(input_path, output_path, fps=fps)
     elif input_path.is_dir():
         frame_paths = load_frames_from_directory(input_path)
         # Copy frames to output if needed
@@ -168,7 +190,6 @@ def main():
         for i, fp in enumerate(frame_paths):
             dst = frames_dir / f"frame_{i:05d}{fp.suffix}"
             if not dst.exists():
-                import shutil
                 shutil.copy2(fp, dst)
         frame_paths = sorted(frames_dir.glob("*"))
     else:
@@ -181,10 +202,12 @@ def main():
 
     # Load SHARP model
     LOGGER.info("Loading SHARP model...")
-    if args.checkpoint_path is None:
+    if checkpoint_path is None:
+        LOGGER.info("No checkpoint provided. Downloading default model from %s", DEFAULT_MODEL_URL)
         state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
     else:
-        state_dict = torch.load(args.checkpoint_path, weights_only=True)
+        LOGGER.info("Loading checkpoint from %s", checkpoint_path)
+        state_dict = torch.load(checkpoint_path, weights_only=True)
 
     predictor = create_predictor(PredictorParams())
     predictor.load_state_dict(state_dict)
@@ -222,16 +245,11 @@ def main():
     # Save metadata
     metadata = {
         "num_frames": len(frame_paths),
-        "fps": args.fps or 30.0,
+        "fps": fps or 30.0,
         "focal_lengths_px": focal_lengths,
         "frame_paths": [str(p.name) for p in frame_paths],
     }
-    import json
     with open(output_path / "extraction_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
     LOGGER.info("Done. Saved %d depth maps to %s", len(frame_paths), depths_dir)
-
-
-if __name__ == "__main__":
-    main()

@@ -36,8 +36,14 @@ LOGGER = logging.getLogger(__name__)
     required=True,
 )
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
-def render_cli(input_path: Path, output_path: Path, verbose: bool):
-    """Predict Gaussians from input images."""
+@click.option(
+    "--sequence",
+    is_flag=True,
+    default=False,
+    help="Render all PLYs in a directory (sorted) into a single MP4 from the identity camera viewpoint.",
+)
+def render_cli(input_path: Path, output_path: Path, verbose: bool, sequence: bool):
+    """Render Gaussians from PLY files."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
     if not torch.cuda.is_available():
@@ -45,6 +51,10 @@ def render_cli(input_path: Path, output_path: Path, verbose: bool):
         exit(1)
 
     output_path.mkdir(exist_ok=True, parents=True)
+
+    if sequence:
+        render_sequence(input_path, output_path)
+        return
 
     params = camera.TrajectoryParams()
 
@@ -118,3 +128,66 @@ def render_gaussians(
         depth = rendering_output.depth[0]
         video_writer.add_frame(color, depth)
     video_writer.close()
+
+
+def render_sequence(input_path: Path, output_path: Path) -> None:
+    """Render all PLYs in a directory (sorted) into a single MP4 from the identity camera.
+
+    Each PLY becomes one frame in the output video. The camera is fixed at the
+    identity viewpoint (origin, looking along +Z).
+    """
+    if not input_path.is_dir():
+        LOGGER.error("--sequence requires a directory of PLY files as input.")
+        return
+
+    ply_paths = sorted(input_path.glob("*.ply"))
+    if len(ply_paths) == 0:
+        LOGGER.error("No PLY files found in %s", input_path)
+        return
+
+    LOGGER.info("Rendering sequence of %d PLY files from %s", len(ply_paths), input_path)
+
+    device = torch.device("cuda")
+    renderer = None
+    video_writer = None
+
+    identity_extrinsics = torch.eye(4, device=device, dtype=torch.float32)
+
+    for i, ply_path in enumerate(ply_paths):
+        LOGGER.info("Rendering frame %d/%d: %s", i + 1, len(ply_paths), ply_path.name)
+        gaussians, metadata = load_ply(ply_path)
+
+        (width, height) = metadata.resolution_px
+        f_px = metadata.focal_length_px
+
+        intrinsics = torch.tensor(
+            [
+                [f_px, 0, (width - 1) / 2.0, 0],
+                [0, f_px, (height - 1) / 2.0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+
+        if renderer is None:
+            renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
+        if video_writer is None:
+            video_path = output_path / "sequence.mp4"
+            video_writer = io.VideoWriter(video_path, render_depth=False)
+
+        rendering_output = renderer(
+            gaussians.to(device),
+            extrinsics=identity_extrinsics[None],
+            intrinsics=intrinsics[None],
+            image_width=width,
+            image_height=height,
+        )
+        color = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+        depth = rendering_output.depth[0]
+        video_writer.add_frame(color, depth)
+
+    if video_writer is not None:
+        video_writer.close()
+        LOGGER.info("Sequence rendered to %s", output_path / "sequence.mp4")

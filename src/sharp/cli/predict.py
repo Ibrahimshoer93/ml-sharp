@@ -156,13 +156,26 @@ def predict_cli(
 
 
 @torch.no_grad()
-def predict_image(
+def predict_image_with_depth(
     predictor: RGBGaussianPredictor,
     image: np.ndarray,
     f_px: float,
     device: torch.device,
+    aligned_depth: torch.Tensor | None = None,
 ) -> Gaussians3D:
-    """Predict Gaussians from an image."""
+    """Predict Gaussians from an image, optionally using aligned depth as guidance.
+
+    Args:
+        predictor: RGBGaussianPredictor model.
+        image: HxWx3 uint8 numpy array.
+        f_px: Focal length in pixels.
+        device: Torch device.
+        aligned_depth: Optional [1, 1, H, W] aligned depth tensor for cross-frame consistency.
+            Passed as the ``depth`` argument to the predictor.
+
+    Returns:
+        Gaussians3D in metric space.
+    """
     internal_shape = (1536, 1536)
 
     LOGGER.info("Running preprocessing.")
@@ -177,9 +190,16 @@ def predict_image(
         align_corners=True,
     )
 
+    # Prepare depth input if provided
+    depth_input = None
+    if aligned_depth is not None:
+        depth_input = F.interpolate(
+            aligned_depth, size=internal_shape, mode="bilinear", align_corners=True
+        )
+
     # Predict Gaussians in the NDC space.
     LOGGER.info("Running inference.")
-    gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+    gaussians_ndc = predictor(image_resized_pt, disparity_factor, depth=depth_input)
 
     LOGGER.info("Running postprocessing.")
     intrinsics = (
@@ -204,3 +224,14 @@ def predict_image(
     )
 
     return gaussians
+
+
+@torch.no_grad()
+def predict_image(
+    predictor: RGBGaussianPredictor,
+    image: np.ndarray,
+    f_px: float,
+    device: torch.device,
+) -> Gaussians3D:
+    """Predict Gaussians from an image."""
+    return predict_image_with_depth(predictor, image, f_px, device, aligned_depth=None)
