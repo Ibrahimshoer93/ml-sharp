@@ -41,6 +41,24 @@ def colorize_alpha(alpha: torch.Tensor) -> torch.Tensor:
     return colorize_scalar_map(alpha.squeeze(-3), val_min=0.0, val_max=1.0, color_map="coolwarm")
 
 
+def depth_to_image(depth: np.ndarray, val_max: float | None = None) -> np.ndarray:
+    """Convert an HxW float32 depth map to an HxWx3 uint8 turbo-colorized image.
+
+    Args:
+        depth: HxW numpy depth map (metric, in meters).
+        val_max: Clip depth at this value. Defaults to METRIC_DEPTH_MAX_CLAMP_METER.
+
+    Returns:
+        HxWx3 uint8 RGB image.
+    """
+    if val_max is None:
+        val_max = METRIC_DEPTH_MAX_CLAMP_METER
+    cmap = plt.get_cmap("turbo")
+    normalized = np.clip(depth / max(val_max, 1e-6), 0.0, 1.0)
+    colored = cmap(normalized)[..., :3]  # drop alpha
+    return (colored * 255.0).astype(np.uint8)
+
+
 def colorize_scalar_map(
     scalar_map: torch.Tensor, val_min=0.0, val_max=1.0, color_map: str = "jet"
 ) -> torch.Tensor:

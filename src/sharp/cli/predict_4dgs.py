@@ -19,6 +19,7 @@ import logging
 from pathlib import Path
 
 import click
+import imageio.v2 as iio
 import numpy as np
 import torch
 
@@ -38,6 +39,59 @@ from .predict import predict_image_with_depth
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
+
+
+def _load_corrected_depths(
+    corrected_dir: Path,
+    num_frames: int,
+    expected_shape: tuple[int, int],
+) -> list[np.ndarray]:
+    """Load user-corrected depth maps from a directory.
+
+    Supports .npy (float32 metric depth) and 16-bit PNG (depth in millimeters).
+
+    Args:
+        corrected_dir: Directory containing corrected depth files.
+        num_frames: Expected number of frames.
+        expected_shape: (H, W) to resize to if dimensions mismatch.
+
+    Returns:
+        List of HxW float32 depth maps.
+    """
+    corrected = []
+    for i in range(num_frames):
+        npy_path = corrected_dir / f"frame_{i:05d}.npy"
+        png_path = corrected_dir / f"frame_{i:05d}.png"
+
+        if npy_path.exists():
+            depth = np.load(npy_path).astype(np.float32)
+        elif png_path.exists():
+            raw = iio.imread(str(png_path))
+            if raw.dtype == np.uint16:
+                depth = raw.astype(np.float32) / 1000.0  # mm -> meters
+            else:
+                # 8-bit grayscale: treat as normalized [0, 255] -> [0, 50] meters
+                if raw.ndim == 3:
+                    raw = raw[..., 0]
+                depth = raw.astype(np.float32) / 255.0 * 50.0
+        else:
+            raise FileNotFoundError(
+                f"Corrected depth for frame {i} not found. "
+                f"Expected {npy_path} or {png_path}"
+            )
+
+        # Resize if needed
+        if depth.shape != expected_shape:
+            import torch.nn.functional as F
+
+            t = torch.from_numpy(depth)[None, None]
+            t = F.interpolate(t, size=expected_shape, mode="bilinear", align_corners=True)
+            depth = t[0, 0].numpy()
+
+        corrected.append(depth)
+
+    LOGGER.info("Loaded %d corrected depth maps", len(corrected))
+    return corrected
 
 
 @click.command()
@@ -105,6 +159,18 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     default=None,
     help="Limit number of frames to process.",
 )
+@click.option(
+    "--export-depth-images",
+    is_flag=True,
+    default=False,
+    help="Export depth maps as colorized PNG images (before and after alignment).",
+)
+@click.option(
+    "--corrected-depths",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    default=None,
+    help="Directory of user-corrected depth maps (.npy or .png/.exr) to use instead of auto-alignment.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def predict_4dgs_cli(
     input_path: Path,
@@ -117,6 +183,8 @@ def predict_4dgs_cli(
     rgb_diff_threshold: float,
     reference_frame: int | None,
     max_frames: int | None,
+    export_depth_images: bool,
+    corrected_depths: Path | None,
     verbose: bool,
 ):
     """Generate 4D Gaussian Splats from extracted frames and depth maps."""
@@ -186,8 +254,23 @@ def predict_4dgs_cli(
     )
     np.save(output_path / "static_mask.npy", static_mask)
 
+    # Export raw (before-alignment) depth images if requested
+    if export_depth_images:
+        from sharp.utils.vis import depth_to_image
+
+        raw_img_dir = output_path / "depth_images" / "raw"
+        raw_img_dir.mkdir(parents=True, exist_ok=True)
+        depth_max = max(d.max() for d in depths)
+        for i, d in enumerate(depths):
+            iio.imwrite(str(raw_img_dir / f"frame_{i:05d}.png"), depth_to_image(d, val_max=depth_max))
+        LOGGER.info("Saved raw depth images to %s", raw_img_dir)
+
     # Step 2: Align depth maps
-    if no_align:
+    if corrected_depths is not None:
+        LOGGER.info("Loading user-corrected depth maps from %s", corrected_depths)
+        aligned_depths = _load_corrected_depths(corrected_depths, num_frames, depths[0].shape)
+        reference_idx = reference_frame if reference_frame is not None else 0
+    elif no_align:
         LOGGER.info("Skipping depth alignment (--no-align)")
         aligned_depths = depths
         reference_idx = 0
@@ -201,6 +284,17 @@ def predict_4dgs_cli(
         aligned_dir.mkdir(exist_ok=True)
         for i, ad in enumerate(aligned_depths):
             np.save(aligned_dir / f"frame_{i:05d}.npy", ad)
+
+    # Export aligned depth images if requested
+    if export_depth_images:
+        from sharp.utils.vis import depth_to_image
+
+        aligned_img_dir = output_path / "depth_images" / "aligned"
+        aligned_img_dir.mkdir(parents=True, exist_ok=True)
+        depth_max = max(ad.max() for ad in aligned_depths)
+        for i, ad in enumerate(aligned_depths):
+            iio.imwrite(str(aligned_img_dir / f"frame_{i:05d}.png"), depth_to_image(ad, val_max=depth_max))
+        LOGGER.info("Saved aligned depth images to %s", aligned_img_dir)
 
     # Step 3: Load SHARP model
     LOGGER.info("Loading SHARP model...")
@@ -266,7 +360,8 @@ def predict_4dgs_cli(
         "color_space": "linearRGB",
         "reference_frame": reference_idx,
         "static_mask_path": "static_mask.npy",
-        "depth_aligned": not no_align,
+        "depth_aligned": not no_align or corrected_depths is not None,
+        "corrected_depths_used": corrected_depths is not None,
         "static_locked": not no_static_lock,
     }
     with open(output_path / "metadata_4dgs.json", "w") as f:
