@@ -31,16 +31,16 @@ def compute_optical_flow_mask(
 
     A reference frame (the temporal middle frame) is chosen automatically.
     We compute N-1 flow fields: ref→frame_0, ref→frame_1, …, ref→frame_{N-1}
-    (skipping ref→ref).  A pixel is static only if its flow magnitude stays
-    below ``flow_magnitude_threshold`` in **every** pair.  This catches
-    accumulated drift that consecutive-pair flow would miss.
+    (skipping ref→ref).  The per-pixel **median** flow magnitude across all
+    pairs is thresholded — the median is robust to a few noisy/outlier frames
+    while still capturing genuine accumulated drift that consecutive-pair flow
+    would miss.
 
     Args:
         frames: List of HxWx3 uint8 RGB frames (N frames).
         device: Torch device for RAFT inference.
-        flow_magnitude_threshold: Maximum flow magnitude (pixels at original
-            resolution) allowed in every ref→frame_i pair for a pixel to be
-            considered static.
+        flow_magnitude_threshold: Maximum median flow magnitude (pixels at
+            original resolution) for a pixel to be considered static.
 
     Returns:
         Boolean mask HxW where True = static pixel.
@@ -69,8 +69,7 @@ def compute_optical_flow_mask(
     ref_img = torch.from_numpy(frames[ref_idx].copy()).permute(2, 0, 1).float()
     ref_img = F.interpolate(ref_img[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
 
-    # Start with all pixels static; AND each pair's result in
-    static_mask = np.ones((h_orig, w_orig), dtype=bool)
+    flow_magnitudes: list[np.ndarray] = []
     pair_count = 0
 
     for idx in range(n):
@@ -91,19 +90,18 @@ def compute_optical_flow_mask(
         mag_orig = F.interpolate(
             mag[:, None], size=(h_orig, w_orig), mode="bilinear", align_corners=False,
         )
-        pair_static = mag_orig[0, 0].cpu().numpy() < flow_magnitude_threshold
-
-        # A pixel must be static in ALL pairs
-        static_mask &= pair_static
+        flow_magnitudes.append(mag_orig[0, 0].cpu().numpy())
         pair_count += 1
 
         if pair_count % 10 == 0 or pair_count == num_pairs:
-            current_pct = 100.0 * int(static_mask.sum()) / total_pixels
-            LOGGER.info(
-                "  Optical flow: %d/%d pairs done — current static: %.1f%%",
-                pair_count, num_pairs, current_pct,
-            )
+            LOGGER.info("  Optical flow: %d/%d pairs done", pair_count, num_pairs)
 
+    # Median flow magnitude per pixel across all ref→frame_i pairs.
+    # Median is robust to a few outlier frames while catching real motion.
+    mag_stack = np.stack(flow_magnitudes, axis=0)  # [num_pairs, H, W]
+    median_mag = np.median(mag_stack, axis=0)  # [H, W]
+
+    static_mask = median_mag < flow_magnitude_threshold
     static_count = int(static_mask.sum())
     static_pct = 100.0 * static_count / total_pixels
 
