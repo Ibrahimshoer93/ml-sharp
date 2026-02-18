@@ -2,11 +2,11 @@
 
 Align depth maps across frames and generate 4D Gaussian Splat sequences.
 
-Expects the output directory from ``sharp extract-depths`` containing:
-    extracted_output_dir/
-    ├── frames/frame_00000.png, frame_00001.png, ...
-    ├── depths/frame_00000.npy, frame_00001.npy, ...
-    └── extraction_metadata.json
+Accepts either:
+  - The output directory from ``sharp extract-depths`` (contains frames/, depths/,
+    extraction_metadata.json), **or**
+  - A video file (.mp4, .mov, …) or a directory of images — depth extraction
+    will run automatically first.
 
 For licensing see accompanying LICENSE file.
 Copyright (C) 2025 Apple Inc. All Rights Reserved.
@@ -39,6 +39,8 @@ from .predict import predict_image_with_depth
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
+
+_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 
 def _load_corrected_depths(
@@ -94,12 +96,26 @@ def _load_corrected_depths(
     return corrected
 
 
+def _needs_extraction(input_path: Path) -> bool:
+    """Return True when *input_path* is a video file or image directory
+    that hasn't been through ``extract-depths`` yet."""
+    if input_path.is_file() and input_path.suffix.lower() in _VIDEO_EXTENSIONS:
+        return True
+    meta = input_path / "extraction_metadata.json"
+    if input_path.is_dir() and not meta.exists():
+        return True
+    return False
+
+
 @click.command()
 @click.option(
     "-i",
     "--input-path",
     type=click.Path(path_type=Path, exists=True),
-    help="Output directory from extract-depths (contains frames/, depths/, extraction_metadata.json).",
+    help=(
+        "Path to: (1) extract-depths output dir, or (2) a video file, "
+        "or (3) a directory of images. Depth extraction runs automatically for (2) and (3)."
+    ),
     required=True,
 )
 @click.option(
@@ -171,6 +187,24 @@ def _load_corrected_depths(
     default=None,
     help="Directory of user-corrected depth maps (.npy or .png/.exr) to use instead of auto-alignment.",
 )
+@click.option(
+    "--use-optical-flow",
+    is_flag=True,
+    default=False,
+    help="Use RAFT optical flow for static mask instead of RGB differencing (more accurate, slower).",
+)
+@click.option(
+    "--flow-threshold",
+    type=float,
+    default=1.0,
+    help="Optical flow magnitude threshold (pixels) for static detection (lower = stricter).",
+)
+@click.option(
+    "--fps",
+    type=float,
+    default=None,
+    help="FPS for frame extraction when input is a video (default: video's native FPS).",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def predict_4dgs_cli(
     input_path: Path,
@@ -185,9 +219,16 @@ def predict_4dgs_cli(
     max_frames: int | None,
     export_depth_images: bool,
     corrected_depths: Path | None,
+    use_optical_flow: bool,
+    flow_threshold: float,
+    fps: float | None,
     verbose: bool,
 ):
-    """Generate 4D Gaussian Splats from extracted frames and depth maps."""
+    """Generate 4D Gaussian Splats from extracted frames and depth maps.
+
+    Accepts a video file, image directory, or an extract-depths output directory.
+    When given raw input, depth extraction runs automatically first.
+    """
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
     # Resolve device
@@ -203,6 +244,28 @@ def predict_4dgs_cli(
 
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # --- Auto-run extract-depths when input is a video / raw image dir ---
+    if _needs_extraction(input_path):
+        from .extract_depths import extract_depths_cli
+
+        extracted_dir = output_path / "_extracted"
+        LOGGER.info(
+            "Input does not contain extraction_metadata.json — "
+            "running extract-depths automatically into %s",
+            extracted_dir,
+        )
+        ctx = click.Context(extract_depths_cli, info_name="extract-depths")
+        ctx.invoke(
+            extract_depths_cli,
+            input_path=input_path,
+            output_path=extracted_dir,
+            checkpoint_path=checkpoint_path,
+            fps=fps,
+            device=str(device),
+            verbose=verbose,
+        )
+        input_path = extracted_dir
+
     # Load extraction metadata
     meta_path = input_path / "extraction_metadata.json"
     if not meta_path.exists():
@@ -216,7 +279,7 @@ def predict_4dgs_cli(
         num_frames = min(num_frames, max_frames)
 
     focal_lengths = meta["focal_lengths_px"]
-    fps = meta.get("fps", 30.0)
+    meta_fps = meta.get("fps", 30.0)
 
     # Load frames and depth maps
     LOGGER.info("Loading %d frames and depth maps...", num_frames)
@@ -251,6 +314,9 @@ def predict_4dgs_cli(
         depths, frames,
         depth_var_percentile=depth_var_percentile,
         rgb_diff_threshold=rgb_diff_threshold,
+        use_optical_flow=use_optical_flow,
+        flow_device=device,
+        flow_magnitude_threshold=flow_threshold,
     )
     np.save(output_path / "static_mask.npy", static_mask)
 
@@ -354,7 +420,7 @@ def predict_4dgs_cli(
     # Save 4DGS metadata
     metadata_4dgs = {
         "num_frames": num_frames,
-        "fps": fps,
+        "fps": meta_fps,
         "resolution": [width, height],
         "focal_lengths_px": focal_lengths[:num_frames],
         "color_space": "linearRGB",
@@ -362,6 +428,7 @@ def predict_4dgs_cli(
         "static_mask_path": "static_mask.npy",
         "depth_aligned": not no_align or corrected_depths is not None,
         "corrected_depths_used": corrected_depths is not None,
+        "optical_flow_mask": use_optical_flow,
         "static_locked": not no_static_lock,
     }
     with open(output_path / "metadata_4dgs.json", "w") as f:

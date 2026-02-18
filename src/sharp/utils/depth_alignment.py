@@ -17,20 +17,111 @@ import torch.nn.functional as F
 
 LOGGER = logging.getLogger(__name__)
 
+# RAFT input size must be divisible by 8
+_RAFT_SIZE = (520, 960)
+
+
+@torch.no_grad()
+def compute_optical_flow_mask(
+    frames: list[np.ndarray],
+    device: torch.device | str = "cpu",
+    flow_magnitude_threshold: float = 1.0,
+    max_pairs: int | None = None,
+) -> np.ndarray:
+    """Compute a static mask using RAFT optical flow from torchvision.
+
+    Pixels whose median flow magnitude across consecutive pairs stays below
+    ``flow_magnitude_threshold`` are considered static.
+
+    Args:
+        frames: List of HxWx3 uint8 RGB frames.
+        device: Torch device for RAFT inference.
+        flow_magnitude_threshold: Maximum median flow magnitude (pixels at RAFT
+            resolution) for a pixel to count as static.
+        max_pairs: If set, subsample to at most this many consecutive pairs
+            (evenly spaced) to save time on long sequences.
+
+    Returns:
+        Boolean mask HxW where True = static pixel.
+    """
+    from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+
+    weights = Raft_Small_Weights.DEFAULT
+    raft = raft_small(weights=weights).eval().to(device)
+    transforms = weights.transforms()
+
+    n = len(frames)
+    h_orig, w_orig = frames[0].shape[:2]
+
+    # Build list of consecutive pair indices, optionally subsampled
+    pair_indices = list(range(n - 1))
+    if max_pairs is not None and len(pair_indices) > max_pairs:
+        step = max(1, len(pair_indices) // max_pairs)
+        pair_indices = pair_indices[::step][:max_pairs]
+
+    flow_magnitudes: list[np.ndarray] = []
+
+    for idx in pair_indices:
+        img1 = torch.from_numpy(frames[idx].copy()).permute(2, 0, 1).float()
+        img2 = torch.from_numpy(frames[idx + 1].copy()).permute(2, 0, 1).float()
+
+        # Resize to RAFT-friendly resolution
+        img1 = F.interpolate(img1[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
+        img2 = F.interpolate(img2[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
+
+        img1_t, img2_t = transforms(img1.to(device), img2.to(device))
+
+        # RAFT returns list of flow predictions (coarse to fine); take the last
+        flow_list = raft(img1_t, img2_t)
+        flow = flow_list[-1]  # [1, 2, H_raft, W_raft]
+
+        mag = torch.sqrt(flow[:, 0] ** 2 + flow[:, 1] ** 2)  # [1, H_raft, W_raft]
+
+        # Resize magnitude back to original frame resolution
+        mag_orig = F.interpolate(mag[:, None], size=(h_orig, w_orig), mode="bilinear", align_corners=False)
+        flow_magnitudes.append(mag_orig[0, 0].cpu().numpy())
+
+    # Median flow magnitude per pixel across all pairs
+    mag_stack = np.stack(flow_magnitudes, axis=0)  # [num_pairs, H, W]
+    median_mag = np.median(mag_stack, axis=0)  # [H, W]
+
+    static_mask = median_mag < flow_magnitude_threshold
+
+    LOGGER.info(
+        "Optical flow static mask: %d / %d pixels (%.1f%%), threshold=%.2f px",
+        static_mask.sum(),
+        static_mask.size,
+        100 * static_mask.sum() / static_mask.size,
+        flow_magnitude_threshold,
+    )
+    return static_mask
+
 
 def compute_static_mask(
     depths: list[np.ndarray],
     frames: list[np.ndarray] | None = None,
     depth_var_percentile: float = 30.0,
     rgb_diff_threshold: float = 15.0,
+    use_optical_flow: bool = False,
+    flow_device: torch.device | str = "cpu",
+    flow_magnitude_threshold: float = 1.0,
 ) -> np.ndarray:
     """Identify static pixels using temporal depth variance and optional RGB differencing.
+
+    When ``use_optical_flow=True`` the RGB differencing heuristic is replaced
+    by RAFT optical-flow based motion detection, which gives a much cleaner
+    static/dynamic separation, especially with subtle camera motion.
 
     Args:
         depths: List of HxW depth maps.
         frames: Optional list of HxWx3 uint8 RGB frames.
         depth_var_percentile: Percentile threshold for depth variance (lower = stricter).
-        rgb_diff_threshold: Max RGB L1 difference to consider a pixel static.
+        rgb_diff_threshold: Max RGB L1 difference to consider a pixel static (ignored when
+            ``use_optical_flow`` is True).
+        use_optical_flow: If True, use RAFT optical flow instead of RGB differencing.
+        flow_device: Device for RAFT inference (only used when ``use_optical_flow`` is True).
+        flow_magnitude_threshold: Max median flow magnitude in pixels for a pixel
+            to be considered static.
 
     Returns:
         Boolean mask HxW where True = static pixel.
@@ -53,6 +144,22 @@ def compute_static_mask(
         depth_static_mask.size,
         100 * depth_static_mask.sum() / depth_static_mask.size,
     )
+
+    if use_optical_flow and frames is not None and len(frames) > 1:
+        LOGGER.info("Computing optical-flow based static mask with RAFT...")
+        flow_static_mask = compute_optical_flow_mask(
+            frames,
+            device=flow_device,
+            flow_magnitude_threshold=flow_magnitude_threshold,
+        )
+        combined_mask = depth_static_mask & flow_static_mask
+        LOGGER.info(
+            "OpticalFlow+Depth combined static pixels: %d / %d (%.1f%%)",
+            combined_mask.sum(),
+            combined_mask.size,
+            100 * combined_mask.sum() / combined_mask.size,
+        )
+        return combined_mask
 
     if frames is not None and len(frames) > 1:
         # Use median frame as reference for RGB differencing
