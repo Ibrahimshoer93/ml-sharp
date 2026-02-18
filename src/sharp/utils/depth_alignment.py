@@ -82,6 +82,11 @@ def compute_optical_flow_mask(
         img1 = F.interpolate(img1[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
         img2 = F.interpolate(img2[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
 
+        # Normalize to [0, 1] — the RAFT transforms expect uint8-like
+        # input and skip the /255 division when the tensor is already float32.
+        img1 = img1 / 255.0
+        img2 = img2 / 255.0
+
         img1_t, img2_t = transforms(img1.to(device), img2.to(device))
 
         flow_list = raft_model(img1_t, img2_t)
