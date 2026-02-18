@@ -73,7 +73,7 @@ def compute_optical_flow_mask(
     # Scale factor for mapping flow magnitudes from RAFT to original resolution
     mag_scale = max(w_orig / w_raft, h_orig / h_raft)
 
-    residual_magnitudes: list[np.ndarray] = []
+    static_mask = None
 
     for idx in range(num_pairs):
         img1 = torch.from_numpy(frames[idx].copy()).permute(2, 0, 1).float()
@@ -119,24 +119,20 @@ def compute_optical_flow_mask(
         # Resize residual magnitude to original frame resolution & scale
         res_t = torch.from_numpy(res_mag)[None, None]
         res_orig = F.interpolate(res_t, size=(h_orig, w_orig), mode="bilinear", align_corners=False)
-        residual_magnitudes.append(res_orig[0, 0].numpy() * mag_scale)
+        res_orig_np = res_orig[0, 0].numpy() * mag_scale
+
+        # Strict AND: pixel must be below threshold in ALL pairs
+        pair_static = res_orig_np < flow_magnitude_threshold
+        if static_mask is None:
+            static_mask = pair_static
+        else:
+            static_mask &= pair_static
 
         if (idx + 1) % 10 == 0 or idx == num_pairs - 1:
-            LOGGER.info("  Optical flow: pair %d/%d done", idx + 1, num_pairs)
+            pct = 100.0 * static_mask.sum() / total_pixels
+            LOGGER.info("  Optical flow: pair %d/%d done (%.1f%% static so far)",
+                        idx + 1, num_pairs, pct)
 
-    # Median residual magnitude per pixel across all consecutive pairs.
-    mag_stack = np.stack(residual_magnitudes, axis=0)  # [num_pairs, H, W]
-    median_mag = np.median(mag_stack, axis=0)  # [H, W]
-
-    # Diagnostic percentiles so the user can tune the threshold
-    pcts = np.percentile(median_mag, [10, 25, 50, 75, 90, 99])
-    LOGGER.info(
-        "  Residual flow percentiles — p10=%.2f  p25=%.2f  p50=%.2f  "
-        "p75=%.2f  p90=%.2f  p99=%.2f px",
-        *pcts,
-    )
-
-    static_mask = median_mag < flow_magnitude_threshold
     static_count = int(static_mask.sum())
     static_pct = 100.0 * static_count / total_pixels
 
