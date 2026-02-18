@@ -27,20 +27,22 @@ def compute_optical_flow_mask(
     device: torch.device | str = "cpu",
     flow_magnitude_threshold: float = 1.0,
 ) -> np.ndarray:
-    """Compute a static mask using RAFT optical flow from a reference frame to ALL others.
+    """Compute a static mask using RAFT optical flow with global motion compensation.
 
-    A reference frame (the temporal middle frame) is chosen automatically.
-    We compute N-1 flow fields: ref→frame_0, ref→frame_1, …, ref→frame_{N-1}
-    (skipping ref→ref).  The per-pixel **median** flow magnitude across all
-    pairs is thresholded — the median is robust to a few noisy/outlier frames
-    while still capturing genuine accumulated drift that consecutive-pair flow
-    would miss.
+    For each consecutive pair the raw RAFT flow is computed and then an affine
+    camera-motion model is fitted (iteratively-reweighted least squares, 2
+    rounds) and subtracted.  The residual captures independent object motion
+    only — camera translation, rotation and zoom are removed.
+
+    The per-pixel **median** residual magnitude across all pairs is
+    thresholded: pixels that stay below ``flow_magnitude_threshold`` in the
+    median are marked as static.
 
     Args:
         frames: List of HxWx3 uint8 RGB frames (N frames).
         device: Torch device for RAFT inference.
-        flow_magnitude_threshold: Maximum median flow magnitude (pixels at
-            original resolution) for a pixel to be considered static.
+        flow_magnitude_threshold: Maximum median residual flow magnitude
+            (pixels at original resolution) for a pixel to count as static.
 
     Returns:
         Boolean mask HxW where True = static pixel.
@@ -48,58 +50,86 @@ def compute_optical_flow_mask(
     from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 
     weights = Raft_Small_Weights.DEFAULT
-    raft = raft_small(weights=weights).eval().to(device)
+    raft_model = raft_small(weights=weights).eval().to(device)
     transforms = weights.transforms()
 
     n = len(frames)
     h_orig, w_orig = frames[0].shape[:2]
+    h_raft, w_raft = _RAFT_SIZE
     total_pixels = h_orig * w_orig
-
-    # Use the middle frame as reference — it minimises maximum temporal
-    # distance to any other frame, giving RAFT the best chance to match.
-    ref_idx = n // 2
-    num_pairs = n - 1  # every frame except ref
+    num_pairs = n - 1
 
     LOGGER.info(
-        "Running RAFT optical flow: reference frame %d → all %d other frames "
-        "(%d frames total, %dx%d)...",
-        ref_idx, num_pairs, n, w_orig, h_orig,
+        "Running RAFT optical flow on %d consecutive pairs (%d frames, %dx%d) "
+        "with global motion compensation...",
+        num_pairs, n, w_orig, h_orig,
     )
 
-    ref_img = torch.from_numpy(frames[ref_idx].copy()).permute(2, 0, 1).float()
-    ref_img = F.interpolate(ref_img[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
+    # Pre-compute coordinate grid for affine fit (at RAFT resolution)
+    ys_raft, xs_raft = np.mgrid[:h_raft, :w_raft].astype(np.float32)
+    n_raft = h_raft * w_raft
+    A = np.column_stack([xs_raft.ravel(), ys_raft.ravel(), np.ones(n_raft, dtype=np.float32)])
 
-    flow_magnitudes: list[np.ndarray] = []
-    pair_count = 0
+    # Scale factor for mapping flow magnitudes from RAFT to original resolution
+    mag_scale = max(w_orig / w_raft, h_orig / h_raft)
 
-    for idx in range(n):
-        if idx == ref_idx:
-            continue
+    residual_magnitudes: list[np.ndarray] = []
 
-        tgt_img = torch.from_numpy(frames[idx].copy()).permute(2, 0, 1).float()
-        tgt_img = F.interpolate(tgt_img[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
+    for idx in range(num_pairs):
+        img1 = torch.from_numpy(frames[idx].copy()).permute(2, 0, 1).float()
+        img2 = torch.from_numpy(frames[idx + 1].copy()).permute(2, 0, 1).float()
 
-        ref_t, tgt_t = transforms(ref_img.to(device), tgt_img.to(device))
+        img1 = F.interpolate(img1[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
+        img2 = F.interpolate(img2[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
 
-        flow_list = raft(ref_t, tgt_t)
-        flow = flow_list[-1]  # [1, 2, H_raft, W_raft]
+        img1_t, img2_t = transforms(img1.to(device), img2.to(device))
 
-        mag = torch.sqrt(flow[:, 0] ** 2 + flow[:, 1] ** 2)  # [1, H_raft, W_raft]
+        flow_list = raft_model(img1_t, img2_t)
+        flow = flow_list[-1][0].cpu().numpy()  # [2, h_raft, w_raft]
 
-        # Resize magnitude back to original frame resolution
-        mag_orig = F.interpolate(
-            mag[:, None], size=(h_orig, w_orig), mode="bilinear", align_corners=False,
-        )
-        flow_magnitudes.append(mag_orig[0, 0].cpu().numpy())
-        pair_count += 1
+        dx = flow[0].ravel()
+        dy = flow[1].ravel()
 
-        if pair_count % 10 == 0 or pair_count == num_pairs:
-            LOGGER.info("  Optical flow: %d/%d pairs done", pair_count, num_pairs)
+        # Iteratively-reweighted affine fit to estimate camera motion.
+        # dx ≈ a0*x + a1*y + a2   (affine model for horizontal flow)
+        # dy ≈ b0*x + b1*y + b2   (affine model for vertical flow)
+        # Two iterations: first unweighted, then downweight outliers (dynamic pixels).
+        wt = np.ones(n_raft, dtype=np.float32)
+        pred_dx = np.zeros(n_raft, dtype=np.float32)
+        pred_dy = np.zeros(n_raft, dtype=np.float32)
 
-    # Median flow magnitude per pixel across all ref→frame_i pairs.
-    # Median is robust to a few outlier frames while catching real motion.
-    mag_stack = np.stack(flow_magnitudes, axis=0)  # [num_pairs, H, W]
+        for _iter in range(2):
+            Aw = A * wt[:, None]  # [N, 3]  weighted design matrix
+            AtWA = Aw.T @ A  # [3, 3]
+            coeff_x = np.linalg.solve(AtWA, Aw.T @ dx)
+            coeff_y = np.linalg.solve(AtWA, Aw.T @ dy)
+            pred_dx = A @ coeff_x
+            pred_dy = A @ coeff_y
+            residual = np.sqrt((dx - pred_dx) ** 2 + (dy - pred_dy) ** 2)
+            med_res = np.median(residual)
+            wt = (residual < 3.0 * med_res + 1e-6).astype(np.float32)
+
+        res_mag = residual.reshape(h_raft, w_raft)
+
+        # Resize residual magnitude to original frame resolution & scale
+        res_t = torch.from_numpy(res_mag)[None, None]
+        res_orig = F.interpolate(res_t, size=(h_orig, w_orig), mode="bilinear", align_corners=False)
+        residual_magnitudes.append(res_orig[0, 0].numpy() * mag_scale)
+
+        if (idx + 1) % 10 == 0 or idx == num_pairs - 1:
+            LOGGER.info("  Optical flow: pair %d/%d done", idx + 1, num_pairs)
+
+    # Median residual magnitude per pixel across all consecutive pairs.
+    mag_stack = np.stack(residual_magnitudes, axis=0)  # [num_pairs, H, W]
     median_mag = np.median(mag_stack, axis=0)  # [H, W]
+
+    # Diagnostic percentiles so the user can tune the threshold
+    pcts = np.percentile(median_mag, [10, 25, 50, 75, 90, 99])
+    LOGGER.info(
+        "  Residual flow percentiles — p10=%.2f  p25=%.2f  p50=%.2f  "
+        "p75=%.2f  p90=%.2f  p99=%.2f px",
+        *pcts,
+    )
 
     static_mask = median_mag < flow_magnitude_threshold
     static_count = int(static_mask.sum())
@@ -107,9 +137,9 @@ def compute_optical_flow_mask(
 
     LOGGER.info(
         "Optical-flow static mask — static pixels: %d / %d (%.1f%% of %dx%d image), "
-        "threshold: %.2f px, reference frame: %d, pairs evaluated: %d",
+        "threshold: %.2f px, pairs evaluated: %d",
         static_count, total_pixels, static_pct, w_orig, h_orig,
-        flow_magnitude_threshold, ref_idx, num_pairs,
+        flow_magnitude_threshold, num_pairs,
     )
     return static_mask
 
