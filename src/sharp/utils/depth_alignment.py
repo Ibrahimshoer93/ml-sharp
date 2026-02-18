@@ -26,20 +26,18 @@ def compute_optical_flow_mask(
     frames: list[np.ndarray],
     device: torch.device | str = "cpu",
     flow_magnitude_threshold: float = 1.0,
-    max_pairs: int | None = None,
 ) -> np.ndarray:
-    """Compute a static mask using RAFT optical flow from torchvision.
+    """Compute a static mask using RAFT optical flow on **all** consecutive frame pairs.
 
-    Pixels whose median flow magnitude across consecutive pairs stays below
-    ``flow_magnitude_threshold`` are considered static.
+    For N frames we compute N-1 flow fields (frame_0->frame_1, frame_1->frame_2, …).
+    The per-pixel median flow magnitude across all pairs is then thresholded:
+    pixels that stay below ``flow_magnitude_threshold`` in the median are static.
 
     Args:
-        frames: List of HxWx3 uint8 RGB frames.
+        frames: List of HxWx3 uint8 RGB frames (N frames).
         device: Torch device for RAFT inference.
-        flow_magnitude_threshold: Maximum median flow magnitude (pixels at RAFT
-            resolution) for a pixel to count as static.
-        max_pairs: If set, subsample to at most this many consecutive pairs
-            (evenly spaced) to save time on long sequences.
+        flow_magnitude_threshold: Maximum median flow magnitude (pixels at
+            original resolution) for a pixel to count as static.
 
     Returns:
         Boolean mask HxW where True = static pixel.
@@ -52,16 +50,17 @@ def compute_optical_flow_mask(
 
     n = len(frames)
     h_orig, w_orig = frames[0].shape[:2]
+    total_pixels = h_orig * w_orig
+    num_pairs = n - 1
 
-    # Build list of consecutive pair indices, optionally subsampled
-    pair_indices = list(range(n - 1))
-    if max_pairs is not None and len(pair_indices) > max_pairs:
-        step = max(1, len(pair_indices) // max_pairs)
-        pair_indices = pair_indices[::step][:max_pairs]
+    LOGGER.info(
+        "Running RAFT optical flow on all %d consecutive pairs (%d frames, %dx%d)...",
+        num_pairs, n, w_orig, h_orig,
+    )
 
     flow_magnitudes: list[np.ndarray] = []
 
-    for idx in pair_indices:
+    for idx in range(num_pairs):
         img1 = torch.from_numpy(frames[idx].copy()).permute(2, 0, 1).float()
         img2 = torch.from_numpy(frames[idx + 1].copy()).permute(2, 0, 1).float()
 
@@ -81,18 +80,22 @@ def compute_optical_flow_mask(
         mag_orig = F.interpolate(mag[:, None], size=(h_orig, w_orig), mode="bilinear", align_corners=False)
         flow_magnitudes.append(mag_orig[0, 0].cpu().numpy())
 
-    # Median flow magnitude per pixel across all pairs
+        if (idx + 1) % 10 == 0 or idx == num_pairs - 1:
+            LOGGER.info("  Optical flow: pair %d/%d done", idx + 1, num_pairs)
+
+    # Median flow magnitude per pixel across ALL pairs
     mag_stack = np.stack(flow_magnitudes, axis=0)  # [num_pairs, H, W]
     median_mag = np.median(mag_stack, axis=0)  # [H, W]
 
     static_mask = median_mag < flow_magnitude_threshold
+    static_count = int(static_mask.sum())
+    static_pct = 100.0 * static_count / total_pixels
 
     LOGGER.info(
-        "Optical flow static mask: %d / %d pixels (%.1f%%), threshold=%.2f px",
-        static_mask.sum(),
-        static_mask.size,
-        100 * static_mask.sum() / static_mask.size,
-        flow_magnitude_threshold,
+        "Optical-flow static mask — static pixels: %d / %d (%.1f%% of %dx%d image), "
+        "threshold: %.2f px, pairs evaluated: %d",
+        static_count, total_pixels, static_pct, w_orig, h_orig,
+        flow_magnitude_threshold, num_pairs,
     )
     return static_mask
 
@@ -127,6 +130,8 @@ def compute_static_mask(
         Boolean mask HxW where True = static pixel.
     """
     depth_stack = np.stack(depths, axis=0)  # [N, H, W]
+    h, w = depth_stack.shape[1], depth_stack.shape[2]
+    total_pixels = h * w
 
     # Normalize each depth to [0,1] range before computing variance
     # (accounts for per-frame scale differences in raw monocular depth)
@@ -137,27 +142,24 @@ def compute_static_mask(
     variance_threshold = np.percentile(depth_variance[depth_variance > 0], depth_var_percentile)
     depth_static_mask = depth_variance < variance_threshold
 
+    depth_static_pct = 100.0 * int(depth_static_mask.sum()) / total_pixels
     LOGGER.info(
-        "Depth variance threshold: %.6f, static pixels from depth: %d / %d (%.1f%%)",
-        variance_threshold,
-        depth_static_mask.sum(),
-        depth_static_mask.size,
-        100 * depth_static_mask.sum() / depth_static_mask.size,
+        "Depth-variance static mask: %d / %d pixels (%.1f%% of %dx%d image)",
+        int(depth_static_mask.sum()), total_pixels, depth_static_pct, w, h,
     )
 
     if use_optical_flow and frames is not None and len(frames) > 1:
-        LOGGER.info("Computing optical-flow based static mask with RAFT...")
         flow_static_mask = compute_optical_flow_mask(
             frames,
             device=flow_device,
             flow_magnitude_threshold=flow_magnitude_threshold,
         )
         combined_mask = depth_static_mask & flow_static_mask
+        combined_pct = 100.0 * int(combined_mask.sum()) / total_pixels
         LOGGER.info(
-            "OpticalFlow+Depth combined static pixels: %d / %d (%.1f%%)",
-            combined_mask.sum(),
-            combined_mask.size,
-            100 * combined_mask.sum() / combined_mask.size,
+            "Combined (depth + optical-flow) static mask: %d / %d pixels "
+            "(%.1f%% of %dx%d image)",
+            int(combined_mask.sum()), total_pixels, combined_pct, w, h,
         )
         return combined_mask
 
@@ -169,11 +171,11 @@ def compute_static_mask(
         rgb_static_mask = max_diff < rgb_diff_threshold
 
         combined_mask = depth_static_mask & rgb_static_mask
+        combined_pct = 100.0 * int(combined_mask.sum()) / total_pixels
         LOGGER.info(
-            "RGB+Depth combined static pixels: %d / %d (%.1f%%)",
-            combined_mask.sum(),
-            combined_mask.size,
-            100 * combined_mask.sum() / combined_mask.size,
+            "Combined (depth + RGB) static mask: %d / %d pixels "
+            "(%.1f%% of %dx%d image)",
+            int(combined_mask.sum()), total_pixels, combined_pct, w, h,
         )
         return combined_mask
 
