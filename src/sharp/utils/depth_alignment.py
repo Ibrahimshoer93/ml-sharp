@@ -27,17 +27,20 @@ def compute_optical_flow_mask(
     device: torch.device | str = "cpu",
     flow_magnitude_threshold: float = 1.0,
 ) -> np.ndarray:
-    """Compute a static mask using RAFT optical flow on **all** consecutive frame pairs.
+    """Compute a static mask using RAFT optical flow from a reference frame to ALL others.
 
-    For N frames we compute N-1 flow fields (frame_0->frame_1, frame_1->frame_2, …).
-    The per-pixel median flow magnitude across all pairs is then thresholded:
-    pixels that stay below ``flow_magnitude_threshold`` in the median are static.
+    A reference frame (the temporal middle frame) is chosen automatically.
+    We compute N-1 flow fields: ref→frame_0, ref→frame_1, …, ref→frame_{N-1}
+    (skipping ref→ref).  A pixel is static only if its flow magnitude stays
+    below ``flow_magnitude_threshold`` in **every** pair.  This catches
+    accumulated drift that consecutive-pair flow would miss.
 
     Args:
         frames: List of HxWx3 uint8 RGB frames (N frames).
         device: Torch device for RAFT inference.
-        flow_magnitude_threshold: Maximum median flow magnitude (pixels at
-            original resolution) for a pixel to count as static.
+        flow_magnitude_threshold: Maximum flow magnitude (pixels at original
+            resolution) allowed in every ref→frame_i pair for a pixel to be
+            considered static.
 
     Returns:
         Boolean mask HxW where True = static pixel.
@@ -51,51 +54,64 @@ def compute_optical_flow_mask(
     n = len(frames)
     h_orig, w_orig = frames[0].shape[:2]
     total_pixels = h_orig * w_orig
-    num_pairs = n - 1
+
+    # Use the middle frame as reference — it minimises maximum temporal
+    # distance to any other frame, giving RAFT the best chance to match.
+    ref_idx = n // 2
+    num_pairs = n - 1  # every frame except ref
 
     LOGGER.info(
-        "Running RAFT optical flow on all %d consecutive pairs (%d frames, %dx%d)...",
-        num_pairs, n, w_orig, h_orig,
+        "Running RAFT optical flow: reference frame %d → all %d other frames "
+        "(%d frames total, %dx%d)...",
+        ref_idx, num_pairs, n, w_orig, h_orig,
     )
 
-    flow_magnitudes: list[np.ndarray] = []
+    ref_img = torch.from_numpy(frames[ref_idx].copy()).permute(2, 0, 1).float()
+    ref_img = F.interpolate(ref_img[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
 
-    for idx in range(num_pairs):
-        img1 = torch.from_numpy(frames[idx].copy()).permute(2, 0, 1).float()
-        img2 = torch.from_numpy(frames[idx + 1].copy()).permute(2, 0, 1).float()
+    # Start with all pixels static; AND each pair's result in
+    static_mask = np.ones((h_orig, w_orig), dtype=bool)
+    pair_count = 0
 
-        # Resize to RAFT-friendly resolution
-        img1 = F.interpolate(img1[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
-        img2 = F.interpolate(img2[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
+    for idx in range(n):
+        if idx == ref_idx:
+            continue
 
-        img1_t, img2_t = transforms(img1.to(device), img2.to(device))
+        tgt_img = torch.from_numpy(frames[idx].copy()).permute(2, 0, 1).float()
+        tgt_img = F.interpolate(tgt_img[None], size=_RAFT_SIZE, mode="bilinear", align_corners=False)
 
-        # RAFT returns list of flow predictions (coarse to fine); take the last
-        flow_list = raft(img1_t, img2_t)
+        ref_t, tgt_t = transforms(ref_img.to(device), tgt_img.to(device))
+
+        flow_list = raft(ref_t, tgt_t)
         flow = flow_list[-1]  # [1, 2, H_raft, W_raft]
 
         mag = torch.sqrt(flow[:, 0] ** 2 + flow[:, 1] ** 2)  # [1, H_raft, W_raft]
 
         # Resize magnitude back to original frame resolution
-        mag_orig = F.interpolate(mag[:, None], size=(h_orig, w_orig), mode="bilinear", align_corners=False)
-        flow_magnitudes.append(mag_orig[0, 0].cpu().numpy())
+        mag_orig = F.interpolate(
+            mag[:, None], size=(h_orig, w_orig), mode="bilinear", align_corners=False,
+        )
+        pair_static = mag_orig[0, 0].cpu().numpy() < flow_magnitude_threshold
 
-        if (idx + 1) % 10 == 0 or idx == num_pairs - 1:
-            LOGGER.info("  Optical flow: pair %d/%d done", idx + 1, num_pairs)
+        # A pixel must be static in ALL pairs
+        static_mask &= pair_static
+        pair_count += 1
 
-    # Median flow magnitude per pixel across ALL pairs
-    mag_stack = np.stack(flow_magnitudes, axis=0)  # [num_pairs, H, W]
-    median_mag = np.median(mag_stack, axis=0)  # [H, W]
+        if pair_count % 10 == 0 or pair_count == num_pairs:
+            current_pct = 100.0 * int(static_mask.sum()) / total_pixels
+            LOGGER.info(
+                "  Optical flow: %d/%d pairs done — current static: %.1f%%",
+                pair_count, num_pairs, current_pct,
+            )
 
-    static_mask = median_mag < flow_magnitude_threshold
     static_count = int(static_mask.sum())
     static_pct = 100.0 * static_count / total_pixels
 
     LOGGER.info(
         "Optical-flow static mask — static pixels: %d / %d (%.1f%% of %dx%d image), "
-        "threshold: %.2f px, pairs evaluated: %d",
+        "threshold: %.2f px, reference frame: %d, pairs evaluated: %d",
         static_count, total_pixels, static_pct, w_orig, h_orig,
-        flow_magnitude_threshold, num_pairs,
+        flow_magnitude_threshold, ref_idx, num_pairs,
     )
     return static_mask
 
